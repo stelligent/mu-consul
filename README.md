@@ -1,5 +1,5 @@
 # mu-consul
-Extension to create a Consul cluster in an environment and register services with the cluster
+Extension to create a [Consul](https://www.consul.io/) cluster in an environment and register services with the cluster
 
 Sample usage: 
 
