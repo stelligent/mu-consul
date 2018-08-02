@@ -1,0 +1,755 @@
+---
+Parameters:
+  ConsulInstanceType:
+    Type: String
+    Description: Instance type to use.
+    Default: t2.micro
+  ConsulDesiredCapacity:
+    Type: Number
+    Default: '3'
+    Description: Number of instances to launch in your consul cluster
+  ConsulMaxSize:
+    Type: Number
+    Default: '5'
+    Description: Maximum number of instances that can be launched in your consul cluster
+  ConsulImageId:
+    Description: AMI to launch
+    Type: String
+    Default: ''
+  ConsulRpcPort:
+    Type: String
+    Description: This is used by servers to handle incoming requests from other agents. TCP only.
+    Default: '8300'
+  ConsulSerfLanPort:
+    Type: String
+    Description: This is used to handle gossip in the LAN. Required by all agents. TCP and UDP.
+    Default: '8301'
+  ConsulSerfWanPort:
+    Type: String
+    Description: This is used to handle gossip in the WAN. TCP and UDP.
+    Default: '8302'
+  ConsulHttpPort:
+    Type: String
+    Description: This is used by clients to talk to the HTTP API. TCP only.
+    Default: '8500'
+  ConsulDnsPort:
+    Type: String
+    Description: Used to resolve DNS queries. TCP and UDP.
+    Default: '8600'
+Resources:
+  ConsulEcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}-consul
+  ConsulEcsAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+    - ConsulClusterLogGroup
+    Properties:
+      VPCZoneIdentifier:
+        Fn::Split:
+        - ","
+        - Fn::ImportValue: !Sub ${InstanceSubnetIds}
+      LaunchConfigurationName: !Ref ConsulContainerInstances
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      MinSize: !Ref ConsulDesiredCapacity
+      MaxSize: !Ref ConsulMaxSize
+      DesiredCapacity: !Ref ConsulDesiredCapacity
+      TargetGroupARNs:
+      - !Ref ConsulElbTargetGroup
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+        PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: '1'
+        MaxBatchSize: '1'
+        PauseTime: PT15M
+        WaitOnResourceSignals: 'true'
+  ConsulContainerInstances:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              awslogs: []
+              jq: []
+              aws-cli: []
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ConsulContainerInstances.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ConsulContainerInstances --region ${AWS::Region}
+                runas=root
+            "/etc/awslogs/etc/proxy.conf":
+              content: !Sub |
+                HTTP_PROXY=http://${HttpProxy}/
+                HTTPS_PROXY=http://${HttpProxy}/
+            "/etc/awslogs/awscli.conf":
+              content: !Sub |
+                [plugins]
+                cwlogs = cwlogs
+                [default]
+                region = ${AWS::Region}
+            "/etc/awslogs/awslogs.conf":
+              content: !Sub |
+                [general]
+                state_file = /var/lib/awslogs/agent-state
+
+                [dmesg]
+                file = /var/log/dmesg
+                log_group_name = ${AWS::StackName}-consul
+                log_stream_name = instance/dmesg/{instance_id}
+
+                [messages]
+                file = /var/log/messages
+                log_group_name = ${AWS::StackName}-consul
+                log_stream_name = instance/messages/{instance_id}
+                datetime_format = %b %d %H:%M:%S
+
+                [docker]
+                file = /var/log/docker
+                log_group_name = ${AWS::StackName}-consul
+                log_stream_name = instance/docker/{instance_id}
+                datetime_format = %Y-%m-%dT%H:%M:%S.%f
+
+                [ecs]
+                file = /var/log/ecs/*
+                log_group_name = ${AWS::StackName}-consul
+                log_stream_name = instance/ecs/{instance_id}
+                datetime_format = %Y-%m-%dT%H:%M:%SZ
+
+                [cloud-init]
+                file = /var/log/cloud-init*
+                log_group_name = ${AWS::StackName}-consul
+                log_stream_name = instance/cloud-init/{instance_id}
+                datetime_format = %Y-%m-%dT%H:%M:%SZ
+
+                [cfn-init]
+                file = /var/log/cfn-init*
+                log_group_name = ${AWS::StackName}-consul
+                log_stream_name = instance/cfn-init/{instance_id}
+                datetime_format = %Y-%m-%d %H:%M:%S
+          commands:
+            01_add_instance_to_cluster:
+              command: !Sub |
+                #!/bin/bash
+                echo ECS_CLUSTER=${ConsulEcsCluster}  >> /etc/ecs/ecs.config
+          services:
+            sysvinit:
+              awslogs:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                - "/etc/awslogs/awslogs.conf"
+                - "/etc/awslogs/etc/proxy.conf"
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                - "/etc/cfn/cfn-hup.conf"
+                - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+    Properties:
+      ImageId: !Ref ConsulImageId
+      SecurityGroups:
+      - !Ref ConsulServerSG
+      - !Ref ConsulRpcClientSG
+      InstanceType: !Ref ConsulInstanceType
+      IamInstanceProfile: !GetAtt ConsulEC2InstanceProfile.Arn
+      KeyName:
+        Fn::If:
+          - HasKeyName
+          - !Ref KeyName
+          - !Ref "AWS::NoValue"
+      UserData:
+        Fn::Base64: !Sub |
+          Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+          MIME-Version: 1.0
+
+          --==BOUNDARY==
+          Content-Type: text/text/x-shellscript; charset="us-ascii"
+
+          #!/bin/bash -xe
+
+          CFN_PROXY_ARGS=""
+          if [[ ! -z "${HttpProxy}" ]]; then
+            echo "Configuring HTTP_PROXY=${HttpProxy}"
+
+            # Set Yum HTTP proxy
+            if [ ! -f /var/lib/cloud/instance/sem/config_yum_http_proxy ]; then
+              echo "proxy=http://${HttpProxy}" >> /etc/yum.conf
+              echo "$$: $(date +%s.%N | cut -b1-13)" > /var/lib/cloud/instance/sem/config_yum_http_proxy
+            fi
+
+            # Set Docker HTTP proxy
+            if [ ! -f /var/lib/cloud/instance/sem/config_docker_http_proxy ]; then
+              echo "export HTTP_PROXY=http://${HttpProxy}/" >> /etc/sysconfig/docker
+              echo "export HTTPS_PROXY=http://${HttpProxy}/" >> /etc/sysconfig/docker
+              echo "$$: $(date +%s.%N | cut -b1-13)" > /var/lib/cloud/instance/sem/config_docker_http_proxy
+
+              service docker restart
+            fi
+
+            # Set ECS agent HTTP proxy
+            if [ ! -f /var/lib/cloud/instance/sem/config_ecs-agent_http_proxy ]; then
+              echo "HTTP_PROXY=${HttpProxy}" >> /etc/ecs/ecs.config
+              echo "NO_PROXY=169.254.169.254,169.254.170.2,/var/run/docker.sock" >> /etc/ecs/ecs.config
+              echo "$$: $(date +%s.%N | cut -b1-13)" > /var/lib/cloud/instance/sem/config_ecs-agent_http_proxy
+            fi
+
+            CFN_PROXY_ARGS="--http-proxy http://${HttpProxy} --https-proxy http://${HttpProxy}"
+          fi
+
+
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ConsulContainerInstances --region ${AWS::Region} $CFN_PROXY_ARGS
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ConsulEcsAutoScalingGroup --region ${AWS::Region} $CFN_PROXY_ARGS
+
+          --==BOUNDARY==
+          Content-Type: text/text/upstart-job; charset="us-ascii"
+
+          #upstart-job
+          description "Consul"
+          author "Stelligent"
+          start on started ecs
+
+          script
+            exec 2>>/var/log/consul-start.log
+            set -x
+            until curl -s http://localhost:51678/v1/metadata
+            do
+                sleep 1
+            done
+
+            instance_arn=$(curl -s http://localhost:51678/v1/metadata | jq -r '. | .ContainerInstanceArn' | awk -F/ '{print $NF}' )
+            aws ecs start-task --cluster ${ConsulEcsCluster} --task-definition ${AWS::StackName}-consul-server --container-instances $instance_arn --started-by $instance_arn --region ${AWS::Region}
+          end script
+          --==BOUNDARY==--
+  ConsulClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub ${AWS::StackName}-consul
+  ConsulApiClientSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub ${VpcId}
+      GroupDescription: Consul API Client Security Group
+  ConsulRpcClientSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub ${VpcId}
+      GroupDescription: Consul RPC Client Security Group
+  ConsulServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub ${VpcId}
+      GroupDescription: Consul Server Security Group
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: !Ref SshAllow
+  ConsulElbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub ${VpcId}
+      GroupDescription: Consul ELB Security Group
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: '443'
+        ToPort: '443'
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '127.0.0.1/32'
+
+  Consul2InternetEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: 'tcp'
+      FromPort: '0'
+      ToPort: '65535'
+      CidrIp: '0.0.0.0/0'
+      GroupId: !GetAtt ConsulServerSG.GroupId
+
+  ConsulApiClientHttpRuleIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulHttpPort
+      ToPort: !Ref ConsulHttpPort
+      SourceSecurityGroupId: !GetAtt ConsulApiClientSG.GroupId
+      GroupId: !GetAtt ConsulServerSG.GroupId
+  ConsulApiClientHttpRuleEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulHttpPort
+      ToPort: !Ref ConsulHttpPort
+      DestinationSecurityGroupId: !GetAtt ConsulServerSG.GroupId
+      GroupId: !GetAtt ConsulApiClientSG.GroupId
+  ConsulApiClientDnsRuleIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulDnsPort
+      ToPort: !Ref ConsulDnsPort
+      SourceSecurityGroupId: !GetAtt ConsulApiClientSG.GroupId
+      GroupId: !GetAtt ConsulServerSG.GroupId
+  ConsulApiClientDnsRuleEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulDnsPort
+      ToPort: !Ref ConsulDnsPort
+      DestinationSecurityGroupId: !GetAtt ConsulServerSG.GroupId
+      GroupId: !GetAtt ConsulApiClientSG.GroupId
+
+  ConsulRpcClientHttpRuleIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulHttpPort
+      ToPort: !Ref ConsulHttpPort
+      SourceSecurityGroupId: !GetAtt ConsulRpcClientSG.GroupId
+      GroupId: !GetAtt ConsulServerSG.GroupId
+  ConsulRpcClientHttpRuleEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulHttpPort
+      ToPort: !Ref ConsulHttpPort
+      DestinationSecurityGroupId: !GetAtt ConsulServerSG.GroupId
+      GroupId: !GetAtt ConsulRpcClientSG.GroupId
+
+  ConsulRpcClientDnsRuleIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulDnsPort
+      ToPort: !Ref ConsulDnsPort
+      SourceSecurityGroupId: !GetAtt ConsulRpcClientSG.GroupId
+      GroupId: !GetAtt ConsulServerSG.GroupId
+  ConsulRpcClientDnsRuleEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulDnsPort
+      ToPort: !Ref ConsulDnsPort
+      DestinationSecurityGroupId: !GetAtt ConsulServerSG.GroupId
+      GroupId: !GetAtt ConsulRpcClientSG.GroupId
+
+  ConsulRpcClientRpcRuleIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulRpcPort
+      ToPort: !Ref ConsulRpcPort
+      SourceSecurityGroupId: !GetAtt ConsulRpcClientSG.GroupId
+      GroupId: !GetAtt ConsulServerSG.GroupId
+  ConsulRpcClientRpcRuleEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulRpcPort
+      ToPort: !Ref ConsulRpcPort
+      DestinationSecurityGroupId: !GetAtt ConsulServerSG.GroupId
+      GroupId: !GetAtt ConsulRpcClientSG.GroupId
+
+  ConsulRpcClientSerfTcpRuleIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulSerfLanPort
+      ToPort: !Ref ConsulSerfWanPort
+      SourceSecurityGroupId: !GetAtt ConsulRpcClientSG.GroupId
+      GroupId: !GetAtt ConsulServerSG.GroupId
+  ConsulRpcClientSerfTcpRuleEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: !Ref ConsulSerfLanPort
+      ToPort: !Ref ConsulSerfWanPort
+      DestinationSecurityGroupId: !GetAtt ConsulServerSG.GroupId
+      GroupId: !GetAtt ConsulRpcClientSG.GroupId
+
+  ConsulRpcClientSerfUdpRuleIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: udp
+      FromPort: !Ref ConsulSerfLanPort
+      ToPort: !Ref ConsulSerfWanPort
+      SourceSecurityGroupId: !GetAtt ConsulRpcClientSG.GroupId
+      GroupId: !GetAtt ConsulServerSG.GroupId
+  ConsulRpcClientSerfUdpRuleEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: udp
+      FromPort: !Ref ConsulSerfLanPort
+      ToPort: !Ref ConsulSerfWanPort
+      DestinationSecurityGroupId: !GetAtt ConsulServerSG.GroupId
+      GroupId: !GetAtt ConsulRpcClientSG.GroupId
+
+  ConsulRpcClientSerfUdpReplyRuleIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: udp
+      FromPort: !Ref ConsulSerfLanPort
+      ToPort: !Ref ConsulSerfWanPort
+      SourceSecurityGroupId: !GetAtt ConsulServerSG.GroupId
+      GroupId: !GetAtt ConsulRpcClientSG.GroupId
+  ConsulRpcClientSerfUdpReplyRuleEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: udp
+      FromPort: !Ref ConsulSerfLanPort
+      ToPort: !Ref ConsulSerfWanPort
+      DestinationSecurityGroupId: !GetAtt ConsulRpcClientSG.GroupId
+      GroupId: !GetAtt ConsulServerSG.GroupId
+
+  ConsulElb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets:
+        Fn::Split:
+        - ","
+        - Fn::ImportValue: !Sub ${InstanceSubnetIds}
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+      SecurityGroups:
+      - !Ref ConsulElbSG
+      - !Ref ConsulApiClientSG
+  ConsulElbHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ConsulElb
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref ConsulElbTargetGroup
+      Port: '80'
+      Protocol: HTTP
+  ConsulElbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 5
+      HealthCheckPath: /v1/agent/self
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 3
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 200-299
+      Port: !Ref ConsulHttpPort
+      Protocol: HTTP
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: 60
+      UnhealthyThresholdCount: 5
+      VpcId:
+        Fn::ImportValue: !Sub ${VpcId}
+  ConsulElbHttpListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+      - Type: forward
+        TargetGroupArn: !Ref ConsulElbTargetGroup
+      Conditions:
+      - Field: path-pattern
+        Values:
+        - '/*'
+      ListenerArn: !Ref ConsulElbHttpListener
+      Priority: 1
+  ConsulServerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: host
+      Family: !Sub "${AWS::StackName}-consul-server"
+      ContainerDefinitions:
+      - Name: consul-server
+        Cpu: 400
+        Essential: 'true'
+        Image: 'consul:1.0.0'
+        Memory: 256
+        Environment:
+          - Name: CONSUL_BIND_INTERFACE
+            Value: eth0
+          - Name: CONSUL_CLIENT_INTERFACE
+            Value: eth0
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref AWS::StackName
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: instance
+        Command:
+          - 'agent'
+          - '-server'
+          - '-bootstrap-expect'
+          - !Ref DesiredCapacity
+          - '-ui'
+          - '-datacenter'
+          - !Ref AWS::Region
+          - '-retry-join'
+          - !Sub 'provider=aws tag_key=aws:autoscaling:groupName tag_value=${ConsulEcsAutoScalingGroup}'
+        PortMappings:
+        - HostPort: !Ref ConsulHttpPort
+          ContainerPort: !Ref ConsulHttpPort
+      Volumes: []
+      TaskRoleArn: !GetAtt ConsulServerTaskRole.Arn
+  ConsulEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: IsConsulEnabled
+    Properties:
+      Path: "/"
+      Roles:
+      - !Ref ConsulEC2Role
+  ConsulEC2Role:
+    Type: AWS::IAM::Role
+    Condition: IsConsulEnabled
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-consul-instance-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - ecs:RegisterContainerInstance
+            - ecs:DeregisterContainerInstance
+            - ecs:SubmitContainerStateChange
+            - ecs:SubmitTaskStateChange
+            Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ConsulEcsCluster}
+          - Effect: Allow
+            Action:
+            - ecs:StartTelemetrySession
+            - ecs:Poll
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                "ecs:cluster": !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ConsulEcsCluster}
+          - Effect: Allow
+            Action:
+            - ecs:StartTask
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                "ecs:cluster": !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ConsulEcsCluster}
+          - Effect: Allow
+            Action:
+            - ecs:DiscoverPollEndpoint
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogGroups
+            - logs:DescribeLogStreams
+            Resource: '*'
+
+  ConsulServerTaskRole:
+    Type: AWS::IAM::Role
+    Condition: IsConsulEnabled
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-consul-task-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ecs-tasks.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+      Policies:
+      - PolicyName: ecs-task
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - ec2:DescribeTags
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - ecs:DescribeTasks
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                "ecs:cluster": !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ConsulEcsCluster}
+  ConsulAgentTaskDefinition:
+    Condition: HasLaunchTypeEC2
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasConsulServer
+    Properties:
+      NetworkMode: host
+      Family: !Sub "${AWS::StackName}-consul-agent"
+      ContainerDefinitions:
+      - Name: consul-agent
+        Cpu: 200
+        Essential: 'true'
+        Image: 'consul:1.0.0'
+        Memory: 128
+        Environment:
+          - Name: CONSUL_BIND_INTERFACE
+            Value: eth0
+          - Name: CONSUL_CLIENT_INTERFACE
+            Value: docker0
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref AWS::StackName
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: instance
+        Command:
+          - 'agent'
+          - '-datacenter'
+          - !Ref AWS::Region
+          - '-retry-join'
+          - !Sub 'provider=aws tag_key=aws:autoscaling:groupName tag_value=${ConsulEcsAutoScalingGroup}'
+      - Name: registrator
+        Cpu: 200
+        Essential: 'true'
+        Image: 'gliderlabs/registrator'
+        Memory: 128
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref AWS::StackName
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: instance
+        Command:
+          - "-retry-attempts=-1"
+          - !Sub "consul://172.17.0.1:8500"
+        MountPoints:
+          - ContainerPath: /tmp/docker.sock
+            SourceVolume: dockersock
+      Volumes:
+        - Name: dockersock
+          Host:
+            SourcePath: /var/run/docker.sock
+      TaskRoleArn: !Ref ConsulTaskRoleArn
+      
+  ContainerInstances:
+    Properties:
+      SecurityGroups:
+      - !Ref ConsulRpcClientSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+          MIME-Version: 1.0
+
+          --==BOUNDARY==
+          Content-Type: text/text/x-shellscript; charset="us-ascii"
+
+          #!/bin/bash -xe
+
+          CFN_PROXY_ARGS=""
+          if [[ ! -z "${HttpProxy}" ]]; then
+            echo "Configuring HTTP_PROXY=${HttpProxy}"
+
+            # Set Yum HTTP proxy
+            if [ ! -f /var/lib/cloud/instance/sem/config_yum_http_proxy ]; then
+              echo "proxy=http://${HttpProxy}" >> /etc/yum.conf
+              echo "$$: $(date +%s.%N | cut -b1-13)" > /var/lib/cloud/instance/sem/config_yum_http_proxy
+            fi
+
+            # Set Docker HTTP proxy
+            if [ ! -f /var/lib/cloud/instance/sem/config_docker_http_proxy ]; then
+              echo "export HTTP_PROXY=http://${HttpProxy}/" >> /etc/sysconfig/docker
+              echo "export HTTPS_PROXY=http://${HttpProxy}/" >> /etc/sysconfig/docker
+              echo "$$: $(date +%s.%N | cut -b1-13)" > /var/lib/cloud/instance/sem/config_docker_http_proxy
+
+              service docker restart
+            fi
+
+            # Set ECS agent HTTP proxy
+            if [ ! -f /var/lib/cloud/instance/sem/config_ecs-agent_http_proxy ]; then
+              echo "HTTP_PROXY=${HttpProxy}" >> /etc/ecs/ecs.config
+              echo "NO_PROXY=169.254.169.254,169.254.170.2,/var/run/docker.sock" >> /etc/ecs/ecs.config
+              echo "$$: $(date +%s.%N | cut -b1-13)" > /var/lib/cloud/instance/sem/config_ecs-agent_http_proxy
+            fi
+
+            CFN_PROXY_ARGS="--http-proxy http://${HttpProxy} --https-proxy http://${HttpProxy}"
+          fi
+
+          ${ExtraUserData}
+
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ContainerInstances --configsets ${ImageOsType} --region ${AWS::Region} $CFN_PROXY_ARGS
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EcsAutoScalingGroup --region ${AWS::Region} $CFN_PROXY_ARGS
+
+          --==BOUNDARY==
+          Content-Type: text/text/upstart-job; charset="us-ascii"
+
+          #upstart-job
+          description "Consul Agent"
+          author "Stelligent"
+          start on started ecs
+
+          script
+            exec 2>>/var/log/consul-start.log
+            set -x
+            until curl -s http://localhost:51678/v1/metadata
+            do
+                sleep 1
+            done
+
+            echo "Initializing consul agent: ${ConsulServerAutoScalingGroup}"
+
+            instance_arn=$(curl -s http://localhost:51678/v1/metadata | jq -r '. | .ContainerInstanceArn' | awk -F/ '{print $NF}' )
+            aws ecs start-task --cluster ${EcsCluster} --task-definition ${AWS::StackName}-consul-agent --container-instances $instance_arn --started-by $instance_arn --region ${AWS::Region}
+          end script
+
+          --==BOUNDARY==--
+Outputs:
+  ConsulUiUrl:
+    Value: !Sub http://${ConsulElb.DNSName}/ui
+    Description: Consul URL for UI
+  ConsulServerAutoScalingGroup:
+    Value: !Ref ConsulEcsAutoScalingGroup
+    Description: Autoscaling group for consul agents to join
+  ConsulRpcClientSecurityGroup:
+    Value: !Ref ConsulRpcClientSG
+    Description: Security group for consul agents to access consul servers

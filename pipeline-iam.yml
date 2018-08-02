@@ -1,0 +1,31 @@
+Resources:
+  MuAcptRole:
+    Properties:
+      Policies:
+      - PolicyName: deploy-consul-acpt-env
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - cloudformation:CreateStack
+            - cloudformation:UpdateStack
+            - cloudformation:DeleteStack
+            - cloudformation:DescribeStackEvents
+            Resource:
+            - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Namespace}-consul-${AcptEnv}/*
+            Effect: Allow
+  MuProdRole:
+    Properties:
+      Policies:
+      - PolicyName: deploy-consul-prod-env
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - cloudformation:CreateStack
+            - cloudformation:UpdateStack
+            - cloudformation:DeleteStack
+            - cloudformation:DescribeStackEvents
+            Resource:
+            - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Namespace}-consul-${ProdEnv}/*
+            Effect: Allow

@@ -1,0 +1,15 @@
+Resources:
+  CloudFormationRole:
+    Properties:
+      Policies:
+      - PolicyName: deploy-consul
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - iam:PassRole
+            Resource:
+            - !Sub arn:aws:iam::${AWS::AccountId}:role/${Namespace}-environment-*-consul-${AWS::Region}
+            - !Sub arn:aws:iam::${AWS::AccountId}:role/${Namespace}-consul-*-instance-${AWS::Region}
+            - !Sub arn:aws:iam::${AWS::AccountId}:role/${Namespace}-consul-*-task-${AWS::Region}
+            Effect: Allow
